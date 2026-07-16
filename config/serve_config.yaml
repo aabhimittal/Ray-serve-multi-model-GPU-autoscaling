@@ -1,0 +1,64 @@
+# Declarative Ray Serve config -- the production deployment path.
+#
+# Deploy with:   serve deploy config/serve_config.yaml
+# Status:        serve status
+# Tear down:     serve shutdown
+#
+# This mirrors what build_app() constructs in code, but as the declarative
+# schema Ray Serve reconciles. `num_replicas` is omitted so autoscaling_config
+# governs replica count. The custom latency autoscaler (rsa-serve autoscale)
+# then patches each deployment's `autoscaling_config.min_replicas` at runtime
+# via the REST API to hold the latency SLO.
+
+proxy_location: EveryNode
+
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+applications:
+  - name: multi_model_gateway
+    route_prefix: /
+    import_path: ray_serve_autoscale.app:app
+    runtime_env: {}
+    deployments:
+      - name: Gateway
+        num_replicas: 1
+        ray_actor_options:
+          num_cpus: 1
+
+      - name: sentiment
+        max_ongoing_requests: 16
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 6
+          target_ongoing_requests: 8
+          upscale_delay_s: 10.0
+          downscale_delay_s: 120.0
+        ray_actor_options:
+          num_gpus: 0.25
+          num_cpus: 1
+
+      - name: summarization
+        max_ongoing_requests: 8
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 4
+          target_ongoing_requests: 4
+          upscale_delay_s: 10.0
+          downscale_delay_s: 120.0
+        ray_actor_options:
+          num_gpus: 0.5
+          num_cpus: 2
+
+      - name: embedding
+        max_ongoing_requests: 32
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 6
+          target_ongoing_requests: 16
+          upscale_delay_s: 10.0
+          downscale_delay_s: 120.0
+        ray_actor_options:
+          num_gpus: 0.25
+          num_cpus: 1
