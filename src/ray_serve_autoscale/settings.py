@@ -16,7 +16,7 @@ from __future__ import annotations
 import functools
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -72,14 +72,17 @@ class Settings(BaseModel):
     """Top-level application settings."""
 
     backend: Backend = "simulated"
-    ray_address: str | None = None
+    # NOTE: pydantic eagerly evaluates field annotations, so this must stay as
+    # typing.Optional (not `str | None`) to remain importable on Python 3.9,
+    # where PEP 604 unions are not runtime-evaluable.
+    ray_address: Optional[str] = None
     http_host: str = "0.0.0.0"
     http_port: int = 8000
     route_prefix: str = "/"
     models: list[ModelConfig] = Field(default_factory=list)
     autoscaler: AutoscalerConfig = Field(default_factory=AutoscalerConfig)
 
-    def model_by_name(self, name: str) -> ModelConfig | None:
+    def model_by_name(self, name: str) -> Optional[ModelConfig]:
         return next((m for m in self.models if m.name == name), None)
 
 
@@ -127,7 +130,7 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(fh) or {}
 
 
-def load_settings(config_file: str | None = None) -> Settings:
+def load_settings(config_file: Optional[str] = None) -> Settings:
     """Build a :class:`Settings` object from YAML + environment overrides."""
     path_str = config_file or os.environ.get("RSA_CONFIG_FILE")
     data: dict = {}

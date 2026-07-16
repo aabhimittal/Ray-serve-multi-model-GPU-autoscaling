@@ -47,7 +47,13 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W"]
-ignore = ["B008"]  # FastAPI/Serve dependency-injection defaults
+ignore = [
+    "B008",   # FastAPI/Serve dependency-injection defaults
+    # Keep typing.Optional/Union: pydantic eagerly evaluates field annotations,
+    # and PEP 604 `X | None` is not runtime-evaluable on our min target (3.9).
+    "UP007",
+    "UP045",
+]
 
 [tool.mypy]
 python_version = "3.9"
