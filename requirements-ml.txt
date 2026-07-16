@@ -1,0 +1,9 @@
+# Real model backends (GPU). Install on a machine with CUDA:
+#   pip install -r requirements.txt -r requirements-ml.txt
+#
+# Without these packages, the deployments fall back to a deterministic
+# "simulated" backend (configurable compute latency) so the full app and
+# autoscaling loop can be exercised on CPU-only / CI machines.
+torch>=2.1.0
+transformers>=4.38.0
+sentence-transformers>=2.5.0

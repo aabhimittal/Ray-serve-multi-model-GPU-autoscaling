@@ -1,0 +1,62 @@
+# Model registry + autoscaling configuration.
+#
+# Load with:  rsa-serve --config config/models.yaml serve
+# or set:     export RSA_CONFIG_FILE=config/models.yaml
+#
+# Every field maps to ModelConfig / AutoscalerConfig in settings.py. Values not
+# set here fall back to the model defaults.
+
+# backend: "simulated" runs everywhere (CPU/CI); "transformers" loads real
+# HuggingFace models onto the GPU (needs the `ml` extra + CUDA).
+backend: simulated
+
+http_host: 0.0.0.0
+http_port: 8000
+route_prefix: /
+
+models:
+  - name: sentiment
+    task: sentiment
+    hf_model_id: distilbert-base-uncased-finetuned-sst-2-english
+    num_gpus: 0.25          # 4 replicas share one physical GPU
+    num_cpus: 1.0
+    min_replicas: 1
+    max_replicas: 6
+    target_ongoing_requests: 8
+    max_ongoing_requests: 16
+    simulated_latency_s: 0.03
+    latency_slo_ms: 150.0
+
+  - name: summarization
+    task: summarization
+    hf_model_id: sshleifer/distilbart-cnn-12-6
+    num_gpus: 0.5           # larger model, half a GPU each
+    num_cpus: 2.0
+    min_replicas: 1
+    max_replicas: 4
+    target_ongoing_requests: 4
+    max_ongoing_requests: 8
+    simulated_latency_s: 0.15
+    latency_slo_ms: 800.0
+
+  - name: embedding
+    task: embedding
+    hf_model_id: sentence-transformers/all-MiniLM-L6-v2
+    num_gpus: 0.25
+    num_cpus: 1.0
+    min_replicas: 1
+    max_replicas: 6
+    target_ongoing_requests: 16
+    max_ongoing_requests: 32
+    simulated_latency_s: 0.02
+    latency_slo_ms: 120.0
+
+# Custom latency-based supervisory autoscaler.
+autoscaler:
+  enabled: true
+  control_interval_s: 15.0  # how often p95 is sampled and replicas reconsidered
+  scale_up_ratio: 0.9       # p95 >= slo*0.9 -> scale out
+  scale_down_ratio: 0.4     # p95 <= slo*0.4 -> scale in
+  scale_step: 1
+  cooldown_s: 60.0
+  min_samples: 20
