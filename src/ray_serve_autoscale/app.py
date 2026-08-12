@@ -38,9 +38,14 @@ def build_app(settings: Settings | None = None):
             "max_replicas": model.max_replicas,
             "target_ongoing_requests": model.target_ongoing_requests,
             "latency_slo_ms": model.latency_slo_ms,
+            "priority": model.priority,
+            "cold_start_s": model.cold_start_s,
+            "cost_per_gpu_hour_usd": model.cost_per_gpu_hour_usd,
+            "shed_at_slo_fraction": model.shed_at_slo_fraction,
+            "enable_streaming": model.enable_streaming,
         }
 
-    return Gateway.bind(model_handles, model_meta)
+    return Gateway.bind(model_handles, model_meta, settings.admission.model_dump())
 
 
 # Module-level default app so a Serve config file can reference

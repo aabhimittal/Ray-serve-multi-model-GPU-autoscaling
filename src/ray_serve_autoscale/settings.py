@@ -48,6 +48,24 @@ class ModelConfig(BaseModel):
     # above this as pressure to scale out.
     latency_slo_ms: float = 250.0
 
+    # --- Industrial extensions -------------------------------------------
+    # Scheduling priority for cross-model GPU arbitration. When cluster GPU
+    # demand exceeds capacity, higher-priority models are served first.
+    priority: int = 100
+    # Time for a fresh replica to become ready (weights load + CUDA context).
+    # Reactive scaling is always this far behind demand, which is exactly why
+    # the predictive controller projects latency forward by this horizon.
+    cold_start_s: float = 30.0
+    # Price of one GPU-hour for this model's accelerator class; drives the
+    # budget governor.
+    cost_per_gpu_hour_usd: float = 2.5
+    # Reject (rather than queue) a request when the estimated queue wait
+    # already exceeds this fraction of the SLO -- serving a doomed request
+    # burns GPU time that admitted requests need.
+    shed_at_slo_fraction: float = 1.5
+    # Expose a token-streaming endpoint for this model.
+    enable_streaming: bool = True
+
 
 class AutoscalerConfig(BaseModel):
     """Custom latency-based autoscaling controller configuration."""
@@ -67,6 +85,66 @@ class AutoscalerConfig(BaseModel):
     # noise from a near-idle endpoint).
     min_samples: int = 20
 
+    # --- Predictive / decomposition controls ------------------------------
+    # Project latency forward over the cold-start horizon and size replicas
+    # from the ratio (observed / target) instead of stepping by one.
+    predictive: bool = True
+    # Below this queue-share the latency is compute-bound: extra replicas add
+    # throughput but barely move per-request tail latency, so scale-out is
+    # capped to avoid burning GPUs on a problem replicas cannot fix.
+    compute_bound_queue_ratio: float = 0.3
+    # Caps on a single control step, so a transient spike cannot order the
+    # whole cluster (scale-out) or strand in-flight work (scale-in).
+    max_scale_out_step: int = 4
+    max_scale_in_step: int = 1
+    # Consecutive ticks a breach must persist before capacity is ordered.
+    # Smoothing alone cannot absorb an arbitrarily large one-off spike (a 40x
+    # outlier moves any usable EWMA past the trigger), so the controller also
+    # requires the breach to *persist*. Costs one control interval; the
+    # predictive horizon is far larger, so the loop still lands capacity early.
+    scale_out_confirm_ticks: int = 2
+
+
+class SignalConfig(BaseModel):
+    """Smoothing / robustness of the latency signal feeding the controller."""
+
+    # EWMA smoothing factor; lower = smoother, slower to react.
+    ewma_alpha: float = 0.4
+    # Horizon used to estimate the latency trend (ms per second).
+    trend_window_s: float = 90.0
+    # Consecutive identical observations before the feed is deemed stale.
+    # Acting on stale metrics is worse than not acting at all.
+    staleness_ticks: int = 3
+    # Direction changes within ``flap_window`` before flap damping engages.
+    flap_window: int = 6
+    flap_threshold: int = 3
+    # Multiplier applied to the dead band while damping is engaged.
+    flap_deadband_widening: float = 2.0
+
+
+class ClusterConfig(BaseModel):
+    """Finite cluster resources the arbiter must allocate within."""
+
+    # Total schedulable GPUs. 0 disables GPU arbitration (CPU-only / dev).
+    total_gpus: float = 0.0
+    # Hard ceiling on GPU spend per hour across all models. None = unlimited.
+    max_hourly_budget_usd: Optional[float] = None
+    # Reserve headroom so arbitration never packs the cluster to 100%.
+    gpu_headroom_fraction: float = 0.0
+
+
+class AdmissionConfig(BaseModel):
+    """Admission control: load shedding + circuit breaking."""
+
+    enabled: bool = True
+    # Hard cap on requests queued per replica before shedding kicks in.
+    max_queue_depth_per_replica: int = 32
+    # Consecutive/error-rate thresholds for the circuit breaker.
+    error_rate_threshold: float = 0.5
+    breaker_min_requests: int = 20
+    breaker_open_s: float = 15.0
+    breaker_half_open_probes: int = 3
+
 
 class Settings(BaseModel):
     """Top-level application settings."""
@@ -81,6 +159,9 @@ class Settings(BaseModel):
     route_prefix: str = "/"
     models: list[ModelConfig] = Field(default_factory=list)
     autoscaler: AutoscalerConfig = Field(default_factory=AutoscalerConfig)
+    signals: SignalConfig = Field(default_factory=SignalConfig)
+    cluster: ClusterConfig = Field(default_factory=ClusterConfig)
+    admission: AdmissionConfig = Field(default_factory=AdmissionConfig)
 
     def model_by_name(self, name: str) -> Optional[ModelConfig]:
         return next((m for m in self.models if m.name == name), None)

@@ -76,7 +76,7 @@ def _report(model, concurrency, seconds, latencies, errors):
     print(
         f"[{model}] c={concurrency:<4} reqs={n:<6} rps={rps:7.1f} "
         f"p50={p50:7.1f}ms p95={p95:7.1f}ms p99={p99:7.1f}ms "
-        f"mean={statistics.mean(latencies):7.1f}ms errors={errors}"
+        f"mean={statistics.mean(latencies):7.1f}ms err={errors}"
     )
 
 
@@ -108,7 +108,9 @@ async def main_async(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--model", default="sentiment")
     p.add_argument("--concurrency", type=int, default=25)

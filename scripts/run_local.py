@@ -77,7 +77,7 @@ def main():
 
     if not args.no_block:
         print("\nBlocking. Ctrl-C to shut down. "
-              f"Try: python scripts/load_test.py --model sentiment --concurrency 40")
+              "Try: python scripts/load_test.py --model sentiment --concurrency 40")
         try:
             while True:
                 time.sleep(3600)

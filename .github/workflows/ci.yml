@@ -36,6 +36,9 @@ jobs:
           PYTHONPATH=src pytest tests -q \
             --ignore=tests/test_integration_serve.py
 
+      - name: Industrial edge cases (named, so failures are legible in CI)
+        run: PYTHONPATH=src pytest tests/test_industrial_edge_cases.py -v
+
   integration:
     name: End-to-end Ray Serve integration
     runs-on: ubuntu-latest

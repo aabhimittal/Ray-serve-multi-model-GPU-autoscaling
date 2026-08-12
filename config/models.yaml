@@ -15,6 +15,9 @@ http_port: 8000
 route_prefix: /
 
 models:
+  # `priority` forms strict classes for GPU arbitration: a lower-priority
+  # model can never preempt a higher-priority one, however far past its own
+  # SLO it is. `cold_start_s` is how far ahead the predictive controller looks.
   - name: sentiment
     task: sentiment
     hf_model_id: distilbert-base-uncased-finetuned-sst-2-english
@@ -26,6 +29,10 @@ models:
     max_ongoing_requests: 16
     simulated_latency_s: 0.03
     latency_slo_ms: 150.0
+    priority: 300           # customer-facing: served first under contention
+    cold_start_s: 45.0
+    cost_per_gpu_hour_usd: 2.5
+    shed_at_slo_fraction: 1.5
 
   - name: summarization
     task: summarization
@@ -38,6 +45,9 @@ models:
     max_ongoing_requests: 8
     simulated_latency_s: 0.15
     latency_slo_ms: 800.0
+    priority: 200
+    cold_start_s: 90.0      # biggest model: longest to warm, looks furthest ahead
+    cost_per_gpu_hour_usd: 2.5
 
   - name: embedding
     task: embedding
@@ -50,6 +60,9 @@ models:
     max_ongoing_requests: 32
     simulated_latency_s: 0.02
     latency_slo_ms: 120.0
+    priority: 100           # batch-ish: first to yield GPUs under contention
+    cold_start_s: 30.0
+    cost_per_gpu_hour_usd: 2.5
 
 # Custom latency-based supervisory autoscaler.
 autoscaler:
@@ -57,6 +70,37 @@ autoscaler:
   control_interval_s: 15.0  # how often p95 is sampled and replicas reconsidered
   scale_up_ratio: 0.9       # p95 >= slo*0.9 -> scale out
   scale_down_ratio: 0.4     # p95 <= slo*0.4 -> scale in
-  scale_step: 1
+  scale_step: 1             # (per-model controller only)
   cooldown_s: 60.0
   min_samples: 20
+  predictive: true          # size for the latency replicas will FACE, not the
+                            # latency already missed during their cold start
+  compute_bound_queue_ratio: 0.3   # below this queue share, replicas can't help
+  max_scale_out_step: 4
+  max_scale_in_step: 1
+  scale_out_confirm_ticks: 2       # a breach must persist, not just spike
+
+# Signal conditioning: what makes the control loop trustworthy.
+signals:
+  ewma_alpha: 0.4           # lower = smoother, slower to react
+  trend_window_s: 90.0      # horizon used to estimate ms/s of latency drift
+  staleness_ticks: 3        # identical counters before the feed is deemed dead
+  flap_window: 6
+  flap_threshold: 3
+  flap_deadband_widening: 2.0
+
+# Finite cluster resources the arbiter allocates within.
+# total_gpus: 0 disables GPU arbitration (CPU dev boxes and CI).
+cluster:
+  total_gpus: 0.0
+  gpu_headroom_fraction: 0.0
+  max_hourly_budget_usd: null
+
+# Request-path protection while new replicas are still cold-starting.
+admission:
+  enabled: true
+  max_queue_depth_per_replica: 32
+  error_rate_threshold: 0.5
+  breaker_min_requests: 20
+  breaker_open_s: 15.0
+  breaker_half_open_probes: 3

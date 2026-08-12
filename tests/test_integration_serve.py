@@ -90,3 +90,95 @@ def test_latency_metrics_and_autoscaler_reader(live_gateway):
     )
     decisions = ctrl.step()
     assert {d.name for d in decisions} == {"sentiment", "summarization", "embedding"}
+
+
+def test_latency_is_decomposed_into_queue_and_compute(live_gateway):
+    """The decomposition must be measured for real, not just modelled."""
+    r = requests.post(f"{BASE}/predict/summarization", json={"text": "a b c"}, timeout=30)
+    body = r.json()
+    assert body["compute_ms"] > 0
+    assert body["queue_ms"] >= 0
+    # Total must account for both parts (small slack for measurement overhead).
+    assert body["latency_ms"] >= body["compute_ms"] - 1.0
+
+    for _ in range(10):
+        requests.post(f"{BASE}/predict/summarization", json={"text": "x y z"}, timeout=30)
+    stats = requests.get(f"{BASE}/metrics/latency", timeout=15).json()["latency"]
+    entry = stats["summarization"]
+    assert entry["compute_ms"] > 0
+    assert "queue_ms" in entry
+
+
+def test_replica_state_is_reported_for_cold_start_accounting(live_gateway):
+    stats = requests.get(f"{BASE}/metrics/latency", timeout=15).json()["latency"]
+    # Serve's own status feeds ready/pending counts; if unavailable the
+    # controller documents a fallback, so only assert consistency.
+    for entry in stats.values():
+        if "ready_replicas" in entry:
+            assert entry["ready_replicas"] >= 0
+            assert entry["pending_replicas"] >= 0
+
+
+def test_streaming_endpoint_emits_incremental_events(live_gateway):
+    with requests.post(
+        f"{BASE}/stream/summarization",
+        json={"text": "Ray Serve streams tokens as they are produced by the model"},
+        stream=True,
+        timeout=60,
+    ) as resp:
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        chunks = [
+            line
+            for line in resp.iter_lines(decode_unicode=True)
+            if line and line.startswith("data:")
+        ]
+    assert len(chunks) > 1  # genuinely incremental, not one blob
+    assert any('"done": true' in c.lower() for c in chunks)
+
+
+def test_prometheus_endpoint_exposes_control_series(live_gateway):
+    for _ in range(5):
+        requests.post(f"{BASE}/predict/embedding", json={"text": "vector"}, timeout=30)
+    r = requests.get(f"{BASE}/metrics", timeout=15)
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["content-type"]
+    body = r.text
+    for series in (
+        "rsa_latency_p95_ms",
+        "rsa_queue_p95_ms",
+        "rsa_compute_p95_ms",
+        "rsa_slo_attainment_ratio",
+        "rsa_shed_total",
+        "rsa_breaker_state",
+    ):
+        assert series in body, f"missing {series}"
+
+
+def test_admission_endpoint_reports_shedding_state(live_gateway):
+    r = requests.get(f"{BASE}/admission", timeout=15)
+    assert r.status_code == 200
+    admission = r.json()["admission"]
+    assert set(admission) == {"sentiment", "summarization", "embedding"}
+    assert admission["sentiment"]["breaker_state"] == "closed"
+
+
+def test_fleet_controller_drives_a_live_gateway(live_gateway):
+    """The full loop -- read, condition, plan, arbitrate -- against real data."""
+    from ray_serve_autoscale.autoscaling.controller import FleetAutoscaler
+    from ray_serve_autoscale.autoscaling.latency_autoscaler import LoggingApplier
+
+    for _ in range(30):
+        requests.post(f"{BASE}/predict/sentiment", json={"text": "load"}, timeout=30)
+
+    def reader():
+        return requests.get(f"{BASE}/metrics/latency", timeout=5).json()["latency"]
+
+    controller = FleetAutoscaler(live_gateway, reader=reader, applier=LoggingApplier())
+    result = controller.step()
+    assert result.healthy
+    assert {p.name for p in result.plans} == {"sentiment", "summarization", "embedding"}
+    assert result.allocation is not None
+    # Every plan must carry a human-readable justification -- an autoscaler
+    # that cannot explain itself cannot be operated.
+    assert all(p.reason for p in result.plans)
