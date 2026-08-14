@@ -1,0 +1,181 @@
+{
+  "title": "Ray Serve — Multi-Model GPU Autoscaling",
+  "uid": "rsa-fleet",
+  "schemaVersion": 39,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["ray", "serve", "gpu", "autoscaling"],
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": { "type": "prometheus" },
+        "query": "label_values(rsa_latency_p95_ms, model)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Are we meeting the SLO?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "SLO attainment ratio (>1 = missing the SLO)",
+      "description": "p95 divided by the model's SLO. Normalised across models, so one threshold works for all of them. This is the series to alert on.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "rsa_slo_attainment_ratio{model=~\"$model\"}",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.9 },
+              { "color": "red", "value": 1.0 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency percentiles",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "targets": [
+        { "expr": "rsa_latency_p50_ms{model=~\"$model\"}", "legendFormat": "{{model}} p50" },
+        { "expr": "rsa_latency_p95_ms{model=~\"$model\"}", "legendFormat": "{{model}} p95" },
+        { "expr": "rsa_latency_p99_ms{model=~\"$model\"}", "legendFormat": "{{model}} p99" },
+        { "expr": "rsa_slo_ms{model=~\"$model\"}", "legendFormat": "{{model}} SLO" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "row",
+      "title": "Why is it slow? (queue vs compute decides the remedy)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue time — scaling out FIXES this",
+      "description": "Time spent waiting for a replica. When this dominates, adding replicas directly cuts p95.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "targets": [
+        { "expr": "rsa_queue_p95_ms{model=~\"$model\"}", "legendFormat": "{{model}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "color": { "mode": "palette-classic" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Compute time — scaling out does NOT fix this",
+      "description": "Time inside the model forward pass. When this dominates, more replicas buy throughput but not tail latency: look at prompt length, batch size or the model itself.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+      "targets": [
+        { "expr": "rsa_compute_p95_ms{model=~\"$model\"}", "legendFormat": "{{model}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue share of total latency",
+      "description": "Below ~0.3 the model is compute-bound and the planner caps scale-out.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "targets": [
+        {
+          "expr": "rsa_queue_p95_ms{model=~\"$model\"} / clamp_min(rsa_latency_p95_ms{model=~\"$model\"}, 1)",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 } }
+    },
+    {
+      "type": "row",
+      "title": "Is capacity arriving?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Replicas ready vs cold-starting",
+      "description": "Pending replicas are capacity already paid for but not yet serving — the gap the predictive controller exists to cover.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "targets": [
+        { "expr": "rsa_replicas_ready{model=~\"$model\"}", "legendFormat": "{{model}} ready" },
+        { "expr": "rsa_replicas_pending{model=~\"$model\"}", "legendFormat": "{{model}} warming" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "stacking": { "mode": "normal" } } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Unmet demand (GPU / budget contention)",
+      "description": "Replicas the autoscaler asked for and arbitration could not grant. Sustained non-zero means the cluster or the budget is the binding constraint, not the policy.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "targets": [
+        { "expr": "rsa_replicas_unmet{model=~\"$model\"}", "legendFormat": "{{model}}" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Are we shedding? What does it cost?",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Shed rate",
+      "description": "Requests rejected fast to protect the SLO of admitted traffic. A spike here during a ramp is the system working, not failing.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
+      "targets": [
+        {
+          "expr": "rate(rsa_shed_total{model=~\"$model\"}[5m])",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "type": "stat",
+      "title": "Circuit breaker",
+      "description": "0 closed · 1 half-open · 2 open",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
+      "targets": [
+        { "expr": "rsa_breaker_state{model=~\"$model\"}", "legendFormat": "{{model}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "closed", "color": "green" },
+                "1": { "text": "half-open", "color": "yellow" },
+                "2": { "text": "OPEN", "color": "red" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU spend rate",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+      "targets": [
+        { "expr": "rsa_hourly_cost_usd{model=~\"$model\"}", "legendFormat": "{{model}}" },
+        { "expr": "sum(rsa_hourly_cost_usd)", "legendFormat": "fleet total" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    }
+  ]
+}

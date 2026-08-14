@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import abc
 import hashlib
+import json
 import time
+from collections.abc import Iterator
 from typing import Any
 
 from ray_serve_autoscale.settings import ModelConfig
@@ -33,6 +35,20 @@ class ModelBackend(abc.ABC):
     @abc.abstractmethod
     def predict(self, inputs: list[str]) -> list[Any]:
         """Run inference over a batch of inputs and return one result each."""
+
+    def predict_stream(self, text: str) -> Iterator[str]:
+        """Yield the response incrementally.
+
+        The default implementation runs the ordinary batched path and chunks
+        its output, so every backend gets a working streaming endpoint. A
+        backend able to emit real incremental tokens should override this --
+        the win of streaming is time-to-first-token, which chunking after the
+        fact does not deliver.
+        """
+        result = self.predict([text])[0]
+        text_out = result if isinstance(result, str) else json.dumps(result)
+        for i in range(0, len(text_out), 32):
+            yield text_out[i : i + 32]
 
     @property
     def device(self) -> str:
@@ -58,6 +74,20 @@ class SimulatedBackend(ModelBackend):
         compute_s = self.config.simulated_latency_s * (1.0 + 0.15 * (batch - 1))
         time.sleep(compute_s)
         return [self._fake_result(text) for text in inputs]
+
+    def predict_stream(self, text: str) -> Iterator[str]:
+        """Emit real incremental chunks, paced like token generation."""
+        result = self._fake_result(text)
+        if self.config.task == "summarization":
+            pieces = result["summary_text"].split()
+        else:
+            pieces = json.dumps(result).split()
+        # Per-token pacing, derived from the configured compute time so a
+        # streaming client sees realistic inter-token gaps.
+        per_token = self.config.simulated_latency_s / max(len(pieces), 1)
+        for piece in pieces:
+            time.sleep(per_token)
+            yield piece + " "
 
     def _fake_result(self, text: str) -> Any:
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()

@@ -1,0 +1,145 @@
+# The fleet controller, deployed as its own workload.
+#
+#   kubectl apply -f deploy/kuberay/fleet-autoscaler.yaml
+#
+# Running the controller outside the Ray cluster is deliberate: it must keep
+# observing and correcting while the fleet is saturated or partially wedged,
+# which is exactly when an in-cluster control loop is least likely to get
+# scheduled. It talks to the gateway for metrics and to the Serve REST API on
+# the dashboard agent to move replica floors.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rsa-model-config
+data:
+  models.yaml: |
+    backend: transformers
+
+    # Finite cluster resources the arbiter allocates within. Set total_gpus to
+    # what this cluster can actually schedule -- if it is wrong, the arbiter
+    # cannot prevent the surplus replicas that sit PENDING forever.
+    cluster:
+      total_gpus: 8.0
+      gpu_headroom_fraction: 0.1
+      max_hourly_budget_usd: 40.0
+
+    autoscaler:
+      enabled: true
+      control_interval_s: 15.0
+      predictive: true
+      scale_up_ratio: 0.9
+      scale_down_ratio: 0.4
+      cooldown_s: 60.0
+      min_samples: 20
+      max_scale_out_step: 4
+      max_scale_in_step: 1
+      scale_out_confirm_ticks: 2
+
+    signals:
+      ewma_alpha: 0.4
+      trend_window_s: 90.0
+      staleness_ticks: 3
+      flap_threshold: 3
+
+    admission:
+      enabled: true
+      max_queue_depth_per_replica: 32
+      error_rate_threshold: 0.5
+      breaker_open_s: 15.0
+
+    models:
+      # priority forms strict classes: a lower-priority model can never
+      # preempt a higher one, however far past its own SLO it is.
+      - name: sentiment
+        task: sentiment
+        hf_model_id: distilbert-base-uncased-finetuned-sst-2-english
+        num_gpus: 0.25
+        min_replicas: 1
+        max_replicas: 8
+        target_ongoing_requests: 8
+        latency_slo_ms: 150.0
+        priority: 300
+        cold_start_s: 45.0
+        cost_per_gpu_hour_usd: 2.5
+
+      - name: summarization
+        task: summarization
+        hf_model_id: sshleifer/distilbart-cnn-12-6
+        num_gpus: 0.5
+        min_replicas: 1
+        max_replicas: 6
+        target_ongoing_requests: 4
+        latency_slo_ms: 800.0
+        priority: 200
+        cold_start_s: 90.0
+        cost_per_gpu_hour_usd: 2.5
+
+      - name: embedding
+        task: embedding
+        hf_model_id: sentence-transformers/all-MiniLM-L6-v2
+        num_gpus: 0.25
+        min_replicas: 1
+        max_replicas: 8
+        target_ongoing_requests: 16
+        latency_slo_ms: 120.0
+        priority: 100
+        cold_start_s: 30.0
+        cost_per_gpu_hour_usd: 2.5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rsa-fleet-autoscaler
+  labels:
+    app.kubernetes.io/name: rsa-fleet-autoscaler
+spec:
+  # Exactly one: two controllers would fight over the same replica floors.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rsa-fleet-autoscaler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rsa-fleet-autoscaler
+    spec:
+      containers:
+        - name: autoscaler
+          image: ghcr.io/OWNER/ray-serve-autoscale:latest
+          args:
+            - rsa-serve
+            - --config=/config/models.yaml
+            - fleet
+            - --base-url=http://multi-model-gateway-serve-svc:8000
+            - --dashboard-url=http://multi-model-gateway-head-svc:8265
+          resources:
+            requests: { cpu: "200m", memory: 256Mi }
+            limits: { cpu: "500m", memory: 512Mi }
+          volumeMounts:
+            - { name: model-config, mountPath: /config }
+      volumes:
+        - name: model-config
+          configMap:
+            name: rsa-model-config
+---
+# Scrape the gateway's Prometheus endpoint (see docs/observability.md for the
+# alert rules that pair with these series).
+apiVersion: v1
+kind: Service
+metadata:
+  name: rsa-gateway-metrics
+  labels:
+    app.kubernetes.io/name: ray-serve-autoscale
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8000"
+spec:
+  selector:
+    ray.io/serve: multi-model-gateway-serve
+  ports:
+    - name: serve
+      port: 8000
+      targetPort: 8000

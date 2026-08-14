@@ -1,0 +1,147 @@
+# KubeRay RayService: the multi-model gateway on a GPU cluster.
+#
+#   kubectl apply -f deploy/kuberay/rayservice.yaml
+#   kubectl get rayservice multi-model-gateway -w
+#
+# KubeRay reconciles `serveConfigV2` continuously, so this file is the source
+# of truth for the Serve application. The fleet controller (see
+# fleet-autoscaler.yaml) then patches each deployment's
+# `autoscaling_config.min_replicas` at runtime through the Serve REST API to
+# hold latency SLOs. Both layers coexist: this manifest sets the bounds and
+# policy, the controller moves the floor inside them.
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: multi-model-gateway
+  labels:
+    app.kubernetes.io/name: ray-serve-autoscale
+spec:
+  # Give replicas time to load weights before Serve declares them unhealthy;
+  # a large model on a cold node can take well over a minute.
+  serviceUnhealthySecondThreshold: 900
+  deploymentUnhealthySecondThreshold: 900
+
+  serveConfigV2: |
+    proxy_location: EveryNode
+    http_options:
+      host: 0.0.0.0
+      port: 8000
+    applications:
+      - name: multi_model_gateway
+        route_prefix: /
+        import_path: ray_serve_autoscale.app:app
+        runtime_env:
+          env_vars:
+            RSA_BACKEND: transformers
+            RSA_CONFIG_FILE: /home/ray/config/models.yaml
+        deployments:
+          - name: Gateway
+            num_replicas: 2
+            ray_actor_options:
+              num_cpus: 1
+          - name: sentiment
+            max_ongoing_requests: 16
+            autoscaling_config:
+              min_replicas: 1
+              max_replicas: 8
+              target_ongoing_requests: 8
+              upscale_delay_s: 10.0
+              downscale_delay_s: 120.0
+            ray_actor_options:
+              num_gpus: 0.25
+              num_cpus: 1
+          - name: summarization
+            max_ongoing_requests: 8
+            autoscaling_config:
+              min_replicas: 1
+              max_replicas: 6
+              target_ongoing_requests: 4
+              upscale_delay_s: 10.0
+              downscale_delay_s: 120.0
+            ray_actor_options:
+              num_gpus: 0.5
+              num_cpus: 2
+          - name: embedding
+            max_ongoing_requests: 32
+            autoscaling_config:
+              min_replicas: 1
+              max_replicas: 8
+              target_ongoing_requests: 16
+              upscale_delay_s: 10.0
+              downscale_delay_s: 120.0
+            ray_actor_options:
+              num_gpus: 0.25
+              num_cpus: 1
+
+  rayClusterConfig:
+    rayVersion: "2.9.0"
+
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        # The head schedules no model replicas: keep the control plane
+        # responsive while the fleet is saturated.
+        num-gpus: "0"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: rayproject/ray-ml:2.9.0-py310-gpu
+              ports:
+                - { containerPort: 6379, name: gcs }
+                - { containerPort: 8265, name: dashboard }
+                - { containerPort: 8000, name: serve }
+              resources:
+                requests: { cpu: "2", memory: 8Gi }
+                limits: { cpu: "4", memory: 16Gi }
+              volumeMounts:
+                - { name: model-config, mountPath: /home/ray/config }
+          volumes:
+            - name: model-config
+              configMap:
+                name: rsa-model-config
+
+    workerGroupSpecs:
+      - groupName: gpu-workers
+        replicas: 1
+        minReplicas: 1
+        # Bound on GPU nodes. Ray's cluster autoscaler adds nodes when replica
+        # demand exceeds capacity; the fleet controller's arbiter is what
+        # decides who gets served while that node is still booting.
+        maxReplicas: 8
+        rayStartParams: {}
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: rayproject/ray-ml:2.9.0-py310-gpu
+                resources:
+                  requests: { cpu: "4", memory: 32Gi, nvidia.com/gpu: "1" }
+                  limits: { cpu: "8", memory: 48Gi, nvidia.com/gpu: "1" }
+                volumeMounts:
+                  - { name: model-config, mountPath: /home/ray/config }
+                  - { name: model-cache, mountPath: /home/ray/.cache/huggingface }
+            volumes:
+              - name: model-config
+                configMap:
+                  name: rsa-model-config
+              # Shared weight cache: without it every new replica re-downloads
+              # its model, turning a 30s cold start into several minutes and
+              # making autoscaling useless under burst.
+              - name: model-cache
+                persistentVolumeClaim:
+                  claimName: rsa-model-cache
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rsa-model-cache
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 100Gi

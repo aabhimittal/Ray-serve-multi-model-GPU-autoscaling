@@ -81,3 +81,17 @@ default is more robust.
   the built-in autoscaler's decisions.
 - `rsa-serve autoscale --dry-run` — prints the latency controller's decisions
   and reasons each tick without changing the cluster.
+
+---
+
+## Beyond a single model
+
+Everything above scales one deployment from its own p95. On a shared cluster
+that is not enough: GPUs are finite, the sum of locally-correct decisions is
+routinely infeasible, and replicas take 30-90s to become capacity.
+
+[`docs/fleet-control.md`](fleet-control.md) covers the fleet controller, which
+adds cold-start-aware prediction, queue-vs-compute decomposition,
+priority-class GPU arbitration and a budget ceiling — plus the guards
+(staleness, flap damping, breach confirmation, emergency bypass) that make a
+control loop safe to leave running unattended.

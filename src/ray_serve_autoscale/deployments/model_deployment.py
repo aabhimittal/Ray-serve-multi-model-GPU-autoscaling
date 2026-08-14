@@ -1,23 +1,22 @@
 """Generic GPU-backed model deployment.
 
-One of these is instantiated per model in the registry. It combines three
-concerns that every GPU serving deployment needs:
+One of these is instantiated per model in the registry. It combines the
+concerns every GPU serving deployment needs:
 
 1. **GPU placement** -- ``ray_actor_options={"num_gpus": ...}`` reserves a
    (possibly fractional) GPU per replica. Ray's scheduler guarantees the actor
    lands on a node with capacity and pins the fraction.
 2. **Ray Serve built-in autoscaling** -- ``autoscaling_config`` scales replicas
    between ``min_replicas`` and ``max_replicas`` to hold roughly
-   ``target_ongoing_requests`` in flight per replica. Because queue depth and
-   latency are linked by Little's Law, this already provides a first line of
-   latency control.
+   ``target_ongoing_requests`` in flight per replica.
 3. **Dynamic request batching** -- ``@serve.batch`` coalesces concurrent calls
    into one padded GPU forward pass, which is where accelerators earn their
    keep.
-
-On top of Serve's own metrics we keep a :class:`LatencyWindow` per replica so
-the *custom* latency autoscaler (autoscaling/latency_autoscaler.py) can read
-true end-to-end p95 and override the built-in targets when an SLO is at risk.
+4. **Latency decomposition** -- every response carries how much of its service
+   time was *queueing* (waiting for a batch slot) versus *compute* (the actual
+   forward pass). That split is what lets the planner tell "we need more
+   replicas" apart from "the model itself got slower", which are the same
+   symptom with opposite remedies. See autoscaling/planner.py.
 """
 
 from __future__ import annotations
@@ -45,35 +44,87 @@ class ModelDeployment:
         self.config = config
         self._backend = build_backend(config, backend_kind)
         self._latency = LatencyWindow(window_s=30.0)
+        self._queue = LatencyWindow(window_s=30.0)
+        self._compute = LatencyWindow(window_s=30.0)
+        self._inflight = 0
+        self._errors = 0
         self._backend.load()
         self._started = time.time()
 
     @serve.batch(max_batch_size=16, batch_wait_timeout_s=0.02)
     async def _infer_batch(self, inputs: list[str]) -> list[Any]:
-        """Batched inference. Serve fills the batch from concurrent requests."""
-        return self._backend.predict(inputs)
+        """Batched inference. Serve fills the batch from concurrent requests.
+
+        The measured compute time is returned alongside every result so the
+        caller can subtract it from end-to-end latency and recover the
+        queueing component -- the batch is the only place that boundary is
+        actually observable.
+        """
+        started = time.perf_counter()
+        results = self._backend.predict(inputs)
+        compute_ms = (time.perf_counter() - started) * 1000.0
+        return [(result, compute_ms) for result in results]
 
     async def __call__(self, text: str) -> dict:
-        """Handle a single logical request; timing feeds the latency window."""
+        """Handle a single logical request; timing feeds the latency windows."""
         start = time.perf_counter()
-        result = await self._infer_batch(text)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        self._latency.record(elapsed_ms)
+        self._inflight += 1
+        try:
+            result, compute_ms = await self._infer_batch(text)
+        except Exception:
+            self._errors += 1
+            raise
+        finally:
+            self._inflight -= 1
+
+        total_ms = (time.perf_counter() - start) * 1000.0
+        # Everything that was not the forward pass was waiting: batch-window
+        # delay plus contention for the GPU.
+        queue_ms = max(total_ms - compute_ms, 0.0)
+        self._latency.record(total_ms)
+        self._queue.record(queue_ms)
+        self._compute.record(compute_ms)
+
         return {
             "model": self.config.name,
             "task": self.config.task,
             "device": self._backend.device,
-            "latency_ms": round(elapsed_ms, 2),
+            "latency_ms": round(total_ms, 2),
+            "queue_ms": round(queue_ms, 2),
+            "compute_ms": round(compute_ms, 2),
             "result": result,
         }
 
+    async def stream(self, text: str):
+        """Token-by-token streaming, bypassing the batch path.
+
+        Batching optimises throughput for complete responses; streaming
+        optimises time-to-first-token. They pull in opposite directions, so a
+        streaming request runs unbatched rather than waiting for a batch
+        window it would only be held back by.
+        """
+        start = time.perf_counter()
+        self._inflight += 1
+        try:
+            for chunk in self._backend.predict_stream(text):
+                yield chunk
+        finally:
+            self._inflight -= 1
+            self._latency.record((time.perf_counter() - start) * 1000.0)
+
     async def latency_stats(self) -> dict:
-        """Expose the rolling latency snapshot to the custom autoscaler."""
-        snap = self._latency.snapshot()
+        """Per-replica rolling latency snapshot, decomposed."""
+        total = self._latency.snapshot()
+        queue = self._queue.snapshot()
+        compute = self._compute.snapshot()
         return {
             "model": self.config.name,
             "slo_ms": self.config.latency_slo_ms,
-            **snap.as_dict(),
+            "queue_ms": round(queue.p95_ms, 2),
+            "compute_ms": round(compute.p95_ms, 2),
+            "inflight_requests": self._inflight,
+            "errors": self._errors,
+            **total.as_dict(),
         }
 
     async def health(self) -> dict:
@@ -81,6 +132,7 @@ class ModelDeployment:
             "model": self.config.name,
             "device": self._backend.device,
             "uptime_s": round(time.time() - self._started, 1),
+            "inflight_requests": self._inflight,
         }
 
 
